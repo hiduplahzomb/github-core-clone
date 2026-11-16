@@ -42,6 +42,12 @@ export interface Issue {
   user: string;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Cached serialization of this issue's REST view, valid while `updatedAt` matches. Every
+   * mutation of an issue (PATCH, close, comment) bumps `updatedAt` — see rest.ts, graphql.ts and
+   * addComment — and labels are immutable once created, so the cached string cannot go stale.
+   */
+  jsonCache?: { updatedAt: number; json: string };
 }
 
 /** One pull request. headSha/baseSha are the branch tips recorded at creation. */
@@ -85,6 +91,12 @@ export class Repo {
   /** The next issue/PR number; issues and pulls share one sequence, as on GitHub. */
   nextNumber = 1;
   nextCommentId = 1;
+  /**
+   * Cached upload-pack fetch responses, keyed by the resolved fetch arguments plus the object
+   * store's size (see fetchCacheKey in git-http.ts). Objects are content-addressed and only ever
+   * added, so a key that names the store size cannot go stale; the cache dies with the repo.
+   */
+  readonly fetchCache = new Map<string, Buffer>();
 
   constructor(id: number, name: string, description: string, isPrivate: boolean) {
     this.id = id;
@@ -185,6 +197,13 @@ export class Forge {
 /** Store an object, returning its oid. Storing the same bytes twice is a no-op. */
 export function storeObject(repo: Repo, type: GitObject['type'], data: Buffer): string {
   const oid = hashObject(type, data);
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  return oid;
+}
+
+/** Store an object whose oid the caller already computed (the pack reader hashes as it reads),
+ * returning the oid. Storing the same oid twice is a no-op. */
+export function storeObjectWithOid(repo: Repo, oid: string, type: GitObject['type'], data: Buffer): string {
   if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
   return oid;
 }
@@ -499,6 +518,15 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     updated_at: iso(issue.updatedAt),
     comments: issue.comments.length,
   };
+}
+
+/** The issue's REST view as a JSON string, cached on the issue while `updatedAt` is unchanged. */
+export function issueJsonString(repo: Repo, issue: Issue): string {
+  const cached = issue.jsonCache;
+  if (cached !== undefined && cached.updatedAt === issue.updatedAt) return cached.json;
+  const json = JSON.stringify(issueJson(repo, issue));
+  issue.jsonCache = { updatedAt: issue.updatedAt, json };
+  return json;
 }
 
 export function pullJson(repo: Repo, pull: PullRequest): Record<string, unknown> {

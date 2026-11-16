@@ -58,15 +58,26 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** Whether the request's Authorization header carries the configured token. */
-function authorized(req: IncomingMessage, token: string): boolean {
-  if (token === '') return true;
-  return (req.headers.authorization ?? '') === `Bearer ${token}`;
+/** Whether the request's Authorization header carries the configured token. `bearer` is the
+ * precomputed `Bearer <token>` string (empty when no token is configured: allow all). */
+function authorized(req: IncomingMessage, bearer: string): boolean {
+  if (bearer === '') return true;
+  return (req.headers.authorization ?? '') === bearer;
 }
 
 /** Send a JSON response with the request id. A null body sends an empty body (204/202). */
 function sendJson(res: ServerResponse, requestId: string, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const payload = body === null || body === undefined ? '' : JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'x-github-request-id': requestId,
+    ...headers,
+  });
+  res.end(payload);
+}
+
+/** Send a pre-serialized JSON payload with the request id, without stringifying again. */
+function sendJsonRaw(res: ServerResponse, requestId: string, status: number, payload: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': 'application/json',
     'x-github-request-id': requestId,
@@ -84,13 +95,14 @@ function sendRaw(res: ServerResponse, requestId: string, status: number, content
   res.end(body);
 }
 
-/** Split a path into decoded segments, dropping a trailing slash. Null on a bad escape. */
+/** Split a path into decoded segments, dropping a trailing slash. Null on a bad escape.
+ * Segments without a '%' carry no escape and skip the decoder. */
 function splitPath(pathname: string): string[] | null {
   const trimmed = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
   if (trimmed === '' || trimmed === '/') return [];
   const parts = trimmed.split('/').filter((part) => part !== '');
   try {
-    return parts.map((part) => decodeURIComponent(part));
+    return parts.map((part) => (part.includes('%') ? decodeURIComponent(part) : part));
   } catch {
     return null;
   }
@@ -100,8 +112,9 @@ function splitPath(pathname: string): string[] | null {
 export function createApp(): Server {
   const forge = new Forge();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const bearer = token === '' ? '' : `Bearer ${token}`;
   const server = createServer((req, res) => {
-    void handleRequest(forge, token, req, res).catch((err) => {
+    void handleRequest(forge, bearer, req, res).catch((err) => {
       process.stderr.write(`[entry] unhandled request error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
       if (!res.headersSent) {
         try {
@@ -117,7 +130,7 @@ export function createApp(): Server {
   return server;
 }
 
-async function handleRequest(forge: Forge, token: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRequest(forge: Forge, bearer: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestId = nextRequestId();
   const method = (req.method ?? 'GET').toUpperCase();
   let url: URL;
@@ -145,7 +158,7 @@ async function handleRequest(forge: Forge, token: string, req: IncomingMessage, 
   if (segments[0] === 'api' && segments[1] === 'v3') {
     const rest = segments.slice(2);
     const isRoot = rest.length === 0 && method === 'GET';
-    if (!isRoot && !authorized(req, token)) {
+    if (!isRoot && !authorized(req, bearer)) {
       sendJson(res, requestId, 401, { message: 'Bad credentials' });
       return;
     }
@@ -160,7 +173,11 @@ async function handleRequest(forge: Forge, token: string, req: IncomingMessage, 
     }
     try {
       const result = handleRest(forge, method, rest, url.searchParams, parsed, req.headers.host ?? 'localhost');
-      sendJson(res, requestId, result.status, result.body, result.headers ?? {});
+      if (result.rawBody !== undefined) {
+        sendJsonRaw(res, requestId, result.status, result.rawBody, result.headers ?? {});
+      } else {
+        sendJson(res, requestId, result.status, result.body, result.headers ?? {});
+      }
     } catch (err) {
       process.stderr.write(`[entry] REST error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
       sendJson(res, requestId, 500, { message: 'Internal Server Error' });
@@ -174,7 +191,7 @@ async function handleRequest(forge: Forge, token: string, req: IncomingMessage, 
       sendJson(res, requestId, 405, { message: 'Method Not Allowed' });
       return;
     }
-    if (!authorized(req, token)) {
+    if (!authorized(req, bearer)) {
       sendJson(res, requestId, 401, { message: 'Bad credentials' });
       return;
     }
@@ -201,7 +218,7 @@ async function handleRequest(forge: Forge, token: string, req: IncomingMessage, 
       sendJson(res, requestId, 405, { message: 'Method Not Allowed' });
       return;
     }
-    if (!authorized(req, token)) {
+    if (!authorized(req, bearer)) {
       sendJson(res, requestId, 401, { jsonrpc: '2.0', id: null, error: { code: -32000, message: 'Unauthorized' } });
       return;
     }
@@ -227,7 +244,7 @@ async function handleRequest(forge: Forge, token: string, req: IncomingMessage, 
   if (gitService !== null) {
     const owner = segments[0] as string;
     const repoName = (segments[1] as string).slice(0, -'.git'.length);
-    if (!authorized(req, token)) {
+    if (!authorized(req, bearer)) {
       sendJson(res, requestId, 401, { message: 'Bad credentials' });
       return;
     }

@@ -55,7 +55,9 @@ function entryHeader(typeNumber: number, size: number): Buffer {
 
 /**
  * Write a version-2 pack of plain objects, in the caller's order, with the SHA-1 trailer. An
- * empty list writes the 32-byte empty pack.
+ * empty list writes the 32-byte empty pack. Deflate runs at level 1: these packs are small and
+ * short-lived (a fetch response), and level 1 is several times faster than the default while
+ * producing a valid pack any client reads — the trailer is computed over whatever bytes result.
  */
 export function writePack(objects: readonly GitObject[]): Buffer {
   if (objects.length === 0) return EMPTY_PACK;
@@ -67,7 +69,7 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(entryHeader(TYPE_NUMBER[object.type], object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -146,15 +148,70 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
  * a REF_DELTA base the pack itself does not carry (a thin pack leans on the receiver's store);
  * without it an external base is an error. The trailer checksum is verified. Throws on any
  * malformation, so the caller can report an unpack failure instead of storing garbage.
+ * Each returned object carries its oid (already computed while reading), so the caller can store
+ * it without hashing the bytes a second time.
  */
-export function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | undefined): GitObject[] {
+export function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | undefined): Array<GitObject & { oid: string }> {
+  try {
+    return readPackInner(pack, lookup, findStreamEndAdler);
+  } catch {
+    // The Adler fast path failed: either a malformed pack, or the vanishingly rare case where
+    // an entry's Adler bytes appear early inside its deflate data and desynchronize the walk.
+    // Retry with the exact bisection finder, which throws the authoritative error for a bad pack.
+    return readPackInner(pack, lookup, skipZlibStream);
+  }
+}
+
+/** The Adler-32 checksum of a buffer (zlib's, big-endian in the stream trailer). The modulo is
+ * deferred over 5552-byte runs, the largest run that cannot overflow a 32-bit accumulator. */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let at = 0;
+  while (at < data.length) {
+    const end = Math.min(data.length, at + 5552);
+    for (; at < end; at += 1) {
+      a += data[at] as number;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Find where the zlib stream starting at `start` ends, given the bytes it inflates to. A zlib
+ * stream ends with the Adler-32 of its uncompressed data, so the stream's end is the first
+ * occurrence of those four bytes at or after `start + 2` (past the two-byte zlib header), plus
+ * four. Returns -1 when the checksum bytes are not found before `end`. The caller validates the
+ * walk as a whole (every entry's size, the final offset), so a coincidental early match — the
+ * same four bytes inside the deflate data, about one chance in 2^32 per position — falls back
+ * to the bisection finder instead of corrupting the read.
+ */
+function findStreamEndAdler(pack: Buffer, start: number, end: number, inflated: Buffer): number {
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(inflated), 0);
+  const at = pack.indexOf(needle, start + 2);
+  if (at < 0 || at + 4 > end) return -1;
+  return at + 4;
+}
+
+type StreamEndFinder = (pack: Buffer, start: number, end: number, inflated: Buffer) => number;
+
+function readPackInner(
+  pack: Buffer,
+  lookup: ((oid: string) => GitObject | undefined) | undefined,
+  findEnd: StreamEndFinder,
+): Array<GitObject & { oid: string }> {
   if (pack.length < 32) throw new Error('pack is too short for a header and trailer');
   if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack has no PACK signature');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`pack version ${version} is not 2 or 3`);
   if (!verifyPackChecksum(pack)) throw new Error('pack trailer checksum does not match its bytes');
   const count = pack.readUInt32BE(8);
-  const objects: GitObject[] = [];
+  const objects: Array<GitObject & { oid: string }> = [];
   // By pack offset (for OFS_DELTA) and by oid (for REF_DELTA within this pack).
   const byOffset = new Map<number, GitObject>();
   const byOid = new Map<string, GitObject>();
@@ -207,10 +264,11 @@ export function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | und
     } catch {
       throw new Error('pack entry is not valid zlib data');
     }
-    // inflateSync consumes the whole subarray, so find where this entry's stream ended by
-    // re-inflating with a bounded window: walk forward until the stream closes. Node's zlib does
-    // not report the consumed length, so measure it with a manual inflate instead.
-    offset = skipZlibStream(pack, offset, end);
+    // Where this entry's zlib stream ends: the fast path locates it from the inflated bytes'
+    // checksum; the fallback bisects. Either way a -1 here is a malformed stream.
+    const streamEnd = findEnd(pack, offset, end, inflated);
+    if (streamEnd < 0) throw new Error('pack entry zlib stream has no clean end');
+    offset = streamEnd;
     let object: GitObject;
     if (typeNumber === 6 || typeNumber === 7) {
       if (base === undefined) throw new Error('delta entry has no base object');
@@ -223,19 +281,22 @@ export function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | und
     const oid = hashObject(object.type, object.data);
     byOffset.set(entryStart, object);
     byOid.set(oid, object);
-    objects.push(object);
+    objects.push({ ...object, oid });
   }
+  // The walk must end exactly at the trailer: a shortfall means the stream-end finder
+  // desynchronized (or the pack is malformed), and the caller must not trust the objects.
+  if (offset !== end) throw new Error('pack entries do not end at the trailer');
   return objects;
 }
 
 /**
- * Find where the zlib stream starting at `start` ends. Node's inflateSync inflates the first
- * stream in its input and ignores any trailing bytes, so it cannot say where the stream stopped —
- * but it throws on a truncated stream and succeeds on a complete one (trailing bytes or not).
- * That makes "inflates cleanly" a monotone predicate over the end position, so the stream's end
- * is the smallest end that inflates cleanly, found by doubling out to a clean end and bisecting.
- * Packs here are small (the largest is the benchmark's 600-object history), so a dozen tiny
- * inflates per entry is cheap.
+ * Find where the zlib stream starting at `start` ends, by bisection: "inflates cleanly" is a
+ * monotone predicate over the end position, so the stream's end is the smallest end that inflates
+ * cleanly, found by doubling out to a clean end and bisecting. Node's zlib does not report the
+ * consumed length, so this is the exact fallback when the Adler fast path cannot place an end
+ * (a malformed stream, or a coincidental Adler match inside the deflate data). Each probe is a
+ * full inflate, some of which throw, so this runs only on the rare path — the fast path handles
+ * every well-formed pack.
  */
 function skipZlibStream(pack: Buffer, start: number, end: number): number {
   const inflatesCleanly = (at: number): boolean => {

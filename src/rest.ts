@@ -13,6 +13,7 @@ import {
   createIssue,
   createPull,
   issueJson,
+  issueJsonString,
   labelJson,
   pullJson,
   readPathInTree,
@@ -28,11 +29,14 @@ import {
 } from './store.ts';
 import { DEFAULT_BRANCH, VIEWER, iso, nowSec, pageInt } from './util.ts';
 
-/** What a handler returns: a status, optional extra headers, and a JSON body (null for 204). */
+/** What a handler returns: a status, optional extra headers, and a JSON body (null for 204).
+ * `rawBody`, when present, is the response payload verbatim — a pre-serialized JSON string the
+ * router sends without stringifying again. */
 export interface RestResult {
   status: number;
   headers?: Record<string, string>;
   body: unknown;
+  rawBody?: string;
 }
 
 function ok(body: unknown, status = 200, headers?: Record<string, string>): RestResult {
@@ -487,7 +491,12 @@ function handleIssues(
   if (item === undefined) return NOT_FOUND();
 
   if (rest.length === 1) {
-    if (method === 'GET') return ok(issueOrPullJson(repo, item));
+    if (method === 'GET') {
+      // A plain issue serves its cached serialization; a pull request (which shares the issue
+      // number space) renders fresh, since pulls mutate without the issue cache's key.
+      if (!('headRef' in item)) return { status: 200, body: null, rawBody: issueJsonString(repo, item) };
+      return ok(issueOrPullJson(repo, item));
+    }
     if (method === 'PATCH') {
       const input = body as Record<string, unknown> | undefined;
       if (typeof input?.title === 'string') item.title = input.title;

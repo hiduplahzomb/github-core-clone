@@ -18,7 +18,7 @@ import {
 } from './git-objects.ts';
 import { EMPTY_PACK, readPack, writePack } from './pack.ts';
 import { DELIM, FLUSH, dataLines, parsePktLines, pktLine, pktLines, type Packet } from './pktline.ts';
-import { storeObject, type Repo } from './store.ts';
+import { storeObject, storeObjectWithOid, type Repo } from './store.ts';
 import { DEFAULT_BRANCH, ZERO_OID } from './util.ts';
 
 /** The agent string the forge advertises itself with. */
@@ -89,18 +89,20 @@ function peeledTarget(repo: Repo, refOid: string): string | undefined {
   return parseTag(object.data).object;
 }
 
-/** The v2 capability advertisement (upload-pack only). */
+/** The v2 capability advertisement (upload-pack only). Constant bytes: computed once. */
+const ADVERTISE_V2: Buffer = pktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 function advertiseV2(): Buffer {
-  return pktLines([
-    '# service=git-upload-pack\n',
-    'flush',
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return ADVERTISE_V2;
 }
 
 /** The v0 ref advertisement for a service. An empty repository advertises capabilities^{} only. */
@@ -516,6 +518,55 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
 }
 
 /**
+ * The cache key for an upload-pack fetch response. It names everything the response can depend
+ * on: the protocol version and the `done` flag (they shape the sections), the resolved fetch
+ * arguments (wants, haves, shallow boundaries, depth, filters — sorted, since their order does
+ * not change the plan), the deepen-not refs resolved to oids (refs are the one input the plan
+ * reads through names), and the object store's size. Objects are content-addressed and immutable
+ * and only ever added, so the store's size is a complete fingerprint of what a fetch can see:
+ * while the size is unchanged, no object appeared or vanished, and the plan for these arguments
+ * is the same bytes. A push, a ref create, or a contents write grows the store (or resolves a
+ * deepen-not ref differently) and misses the cache, so a cached response can never go stale.
+ */
+function fetchCacheKey(repo: Repo, version: 0 | 2, args: FetchArgs): string {
+  const deepenNot: string[] = [];
+  for (const ref of args.deepenNot) {
+    const resolved = repo.refs.get(ref) ?? repo.refs.get(`refs/heads/${ref}`) ?? (isOid(ref) ? ref : undefined);
+    if (resolved !== undefined) deepenNot.push(resolved);
+  }
+  return JSON.stringify({
+    v: version,
+    n: repo.objects.size,
+    w: [...args.wants].sort(),
+    h: [...args.haves].sort(),
+    s: [...args.shallow].sort(),
+    d: args.depth,
+    dr: args.deepenRelative,
+    ds: args.deepenSince,
+    dn: deepenNot.sort(),
+    f: args.filter,
+    done: args.done,
+  });
+}
+
+/** The most fetch responses one repository keeps; the oldest goes first when it fills. */
+const FETCH_CACHE_MAX = 128;
+
+/** Serve a fetch response from the repository's cache when this exact fetch ran before. */
+function cachedFetch(repo: Repo, version: 0 | 2, args: FetchArgs, compute: () => Buffer): Buffer {
+  const key = fetchCacheKey(repo, version, args);
+  const hit = repo.fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const body = compute();
+  if (repo.fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = repo.fetchCache.keys().next().value;
+    if (oldest !== undefined) repo.fetchCache.delete(oldest);
+  }
+  repo.fetchCache.set(key, body);
+  return body;
+}
+
+/**
  * The v2 fetch response, following git's client state machine (fetch-pack.c do_fetch_pack_v2):
  * when the client sent `done` it is already in get-pack state and expects the shallow-info
  * section, if any, then the packfile — no acknowledgments section at all. When the client sent
@@ -527,6 +578,10 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
  * with no packets is a protocol error to the client.
  */
 function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
+  return cachedFetch(repo, 2, args, () => computeFetchV2(repo, args));
+}
+
+function computeFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const missing = args.wants.filter((oid) => !repo.objects.has(oid));
   const plan = missing.length === 0 ? planFetch(repo, args) : null;
   const parts: Buffer[] = [];
@@ -561,6 +616,10 @@ function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
 
 /** The v0 fetch response: shallow/unshallow lines, NAK or ACKs, then the sideband pack. */
 function handleFetchV0(repo: Repo, args: FetchArgs): Buffer {
+  return cachedFetch(repo, 0, args, () => computeFetchV0(repo, args));
+}
+
+function computeFetchV0(repo: Repo, args: FetchArgs): Buffer {
   const missing = args.wants.filter((oid) => !repo.objects.has(oid));
   const plan = missing.length === 0 ? planFetch(repo, args) : null;
   const parts: Buffer[] = [];
@@ -694,7 +753,7 @@ export function handleReceivePack(repo: Repo, body: Buffer): { contentType: stri
   if (parsed.rest.length > 0) {
     try {
       const objects = readPack(parsed.rest, (oid) => repo.objects.get(oid));
-      for (const object of objects) storeObject(repo, object.type, object.data);
+      for (const object of objects) storeObjectWithOid(repo, object.oid, object.type, object.data);
     } catch (err) {
       unpackError = err instanceof Error ? err.message : String(err);
     }
